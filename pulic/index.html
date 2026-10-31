@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>手工版采集器 v8（CF代理·东财自动采）</title>
+<style>
+:root{--bg:#f5f5f5;--card:#fff;--blue:#3b82f6;--green:#16a34a;--orange:#d97706;--red:#dc2626;--gray:#6b7280;}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:12px;color:#1f2937;line-height:1.5;font-size:14px}
+.card{background:var(--card);border-radius:14px;padding:12px;box-shadow:0 2px 8px rgba(0,0,0,.06);margin-bottom:10px}
+h2{font-size:15px;margin:10px 0 6px;color:var(--blue);border-left:3px solid var(--blue);padding-left:8px}
+h3{font-size:13px;margin:8px 0 4px;color:#374151}
+button{width:100%;padding:12px;border:none;border-radius:10px;font-size:15px;font-weight:600;margin:6px 0;cursor:pointer}
+.btn-go{background:var(--blue);color:#fff}
+.btn-cp{background:#22c55e;color:#fff;display:none}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:4px}
+th,td{border:1px solid #e5e7eb;padding:5px 4px;text-align:left;vertical-align:top}
+th{background:#f3f4f6;font-weight:600;font-size:11px}
+.tag-hard{color:var(--green);font-weight:600;font-size:11px}
+.tag-est{color:var(--orange);font-weight:600;font-size:11px}
+.tag-miss{color:var(--red);font-weight:600;font-size:11px}
+.src{color:var(--gray);font-size:10px;word-break:break-all;display:block;margin-top:2px}
+.empty{color:#9ca3af;font-style:italic}
+.status{padding:8px;border-radius:8px;font-size:13px;margin:6px 0;display:none}
+pre{background:#0f172a;color:#e5e7eb;padding:10px;border-radius:8px;overflow-x:auto;font-size:11px;margin-top:6px;display:none}
+.note{font-size:11px;color:var(--gray);margin-top:4px}
+.sec{border:1px solid #e5e7eb;border-radius:8px;padding:8px;margin-bottom:8px}
+.config{background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px;margin-bottom:10px;font-size:12px}
+.config input{width:100%;padding:6px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;margin-top:4px}
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h2>📊 手工版采集器 v8（CF代理·东财自动采）</h2>
+  
+  <div class="config">
+    <b>⚙️ Cloudflare Pages 域名配置</b>
+    <p>填你的 Pages 域名（不含 https://），留空则直连东财（会被 CORS 拦）：</p>
+    <input id="cfDomain" placeholder="例如：fund-tracker.pages.dev" onchange="updateCF()">
+    <p class="note" style="margin-top:4px">部署后刷新页面，东财接口自动走代理</p>
+  </div>
+
+  <p style="font-size:12px;color:#6b7280">自动查 → 表格输出 → 关联手工版跟踪表 → 不加工只标来源</p>
+  <div class="status" id="st"></div>
+  <button class="btn-go" onclick="runAll()">🔍 采集并生成跟踪表</button>
+  <button class="btn-cp" id="cpBtn" onclick="copyTable()">📋 复制表格文本</button>
+  <div id="out"></div>
+  <pre id="json"></pre>
+</div>
+
+<script>
+// ========== 配置区 ==========
+// 部署后把你的 Pages 域名填到上面输入框，或在这里硬编码：
+let CF_DOMAIN = localStorage.getItem("cfDomain") || "";
+
+function updateCF(){
+  CF_DOMAIN = document.getElementById("cfDomain").value.trim();
+  localStorage.setItem("cfDomain", CF_DOMAIN);
+  setSt("✅ 域名已保存，刷新后生效","#f0fdf4","#166534");
+}
+
+function getProxyUrl(target){
+  if(!CF_DOMAIN){
+    return target; // 直连（会被CORS拦）
+  }
+  return "https://" + CF_DOMAIN + "/api/em?target=" + encodeURIComponent(target);
+}
+
+// ========== 数据定义 ==========
+const POOL=[["太辰光","sz300570"],["华海清科","sh688120"],["长川科技","sz300604"],["汉朔科技","sz301275"],["盛弘股份","sz300693"],["航天智装","sz300455"]];
+const IDX=[["上证指数","sh000001"],["深证成指","sz399001"],["创业板指","sz399006"],["科创50","sh000688"],["沪深300","sh000300"],["中证500","sh000905"]];
+const ETF=[["沪深300ETF","sh510300"],["中证500ETF","sh510500"],["创业板ETF","sz159915"],["科创50ETF","sh588000"]];
+
+const $=e=>document.getElementById(e);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const today=()=>{const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");};
+const secid=c=>c.startsWith("sh")?"1."+c.slice(2):"0."+c.slice(2);
+
+// 页面加载时回填域名
+if(CF_DOMAIN) $("cfDomain").value = CF_DOMAIN;
+
+function setSt(msg,bg,fg){const s=$("st");s.style.display="block";s.style.background=bg;s.style.color=fg;s.innerHTML=msg;}
+
+// ========== 腾讯行情（直连，稳定） ==========
+async function txQuotes(codes){
+  const m={};
+  for(let i=0;i<codes.length;i+=40){
+    try{
+      const r=await fetch("https://qt.gtimg.cn/q="+codes.slice(i,i+40).join(","),{headers:{"User-Agent":"Mozilla/5.0","Referer":"https://gu.qq.com/"}});
+      const t=await r.text();
+      t.split(";").forEach(l=>{
+        if(!l.includes("="))return;
+        const k=l.split("=")[0].replace(/"/g,"").trim();
+        const v=l.split("=").slice(1).join("=").replace(/"/g,"");
+        const f=v.split("~"); if(f.length>10)m[k]=f;
+      });
+    }catch(e){}
+    if(codes.length>40)await sleep(800);
+  }
+  return m;
+}
+
+function pq(f){const p=parseFloat(f[3])||0,yc=parseFloat(f[4])||0;const pct=yc>0?((p-yc)/yc*100):(parseFloat(f[32])||0);return {price:p,pct:+pct.toFixed(2),amount_wan:+(parseFloat(f[37])||0).toFixed(0),pe:f[39]||"",pb:f[46]||""};}
+
+// ========== 东财资金流（走CF代理） ==========
+async function emFlow(c){
+  const target="https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?lmt=5&klt=101&secid="+secid(c)+"&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65";
+  const url=getProxyUrl(target);
+  try{
+    const r=await fetch(url,{headers:{"User-Agent":"Mozilla/5.0","Referer":"https://quote.eastmoney.com/"}});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const d=await r.json();
+    const kl=(d.data&&d.data.klines)||[];
+    return {ok:true,rows:kl.map(k=>{const f=k.split(",");return {date:f[0],net_yi:+(parseFloat(f[1])/1e8).toFixed(3)}}),src:target,via:CF_DOMAIN?"CF代理":"直连"};
+  }catch(e){return {ok:false,src:target,via:CF_DOMAIN?"CF代理失败":"直连被CORS拦",error:String(e)};}
+}
+
+// ========== 东财涨跌家数（走CF代理） ==========
+async function emBreadth(){
+  const target="https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=5000&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14,f3";
+  const url=getProxyUrl(target);
+  try{
+    const r=await fetch(url,{headers:{"User-Agent":"Mozilla/5.0","Referer":"https://quote.eastmoney.com/"}});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const d=await r.json();
+    let up=0,down=0,flat=0,lu=0,ld=0;
+    (d.data&&d.data.diff||[]).forEach(i=>{const p=parseFloat(i.f3)||0;if(p>0)up++;else if(p<0)down++;else flat++;if(p>=9.9)lu++;if(p<=-9.9)ld++;});
+    return {ok:true,data:{up,down,flat,limit_up:lu,limit_down:ld,total:up+down+flat},src:target,via:CF_DOMAIN?"CF代理":"直连"};
+  }catch(e){return {ok:false,src:target,via:CF_DOMAIN?"CF代理失败":"直连被CORS拦",error:String(e)};}
+}
+
+// ========== 东财板块（走CF代理） ==========
+async function emSectors(){
+  const target="https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=80&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:2&fields=f12,f14,f3";
+  const url=getProxyUrl(target);
+  try{
+    const r=await fetch(url,{headers:{"User-Agent":"Mozilla/5.0","Referer":"https://quote.eastmoney.com/"}});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const d=await r.json();
+    const a=(d.data&&d.data.diff||[]).map(x=>({name:x.f14,pct:+(parseFloat(x.f3)||0).toFixed(2)}));
+    return {ok:true,top:[...a].sort((x,y)=>y.pct-x.pct).slice(0,5),bottom:[...a].sort((x,y)=>x.pct-y.pct).slice(0,5),src:target,via:CF_DOMAIN?"CF代理":"直连"};
+  }catch(e){return {ok:false,src:target,via:CF_DOMAIN?"CF代理失败":"直连被CORS拦",error:String(e)};}
+}
+
+// ========== 主流程 ==========
+let RESULT={};
+
+async function runAll(){
+  if(!CF_DOMAIN){
+    if(!confirm("未配置 CF 域名，东财接口将直连（大概率被 CORS 拦）。继续？")) return;
+  }
+
+  setSt("⏳ ① 采集行情（腾讯直连）...","#eff6ff","#1e40af");
+  const allCodes=POOL.map(x=>x[1]).concat(IDX.map(x=>x[1])).concat(ETF.map(x=>x[1]));
+  const q=await txQuotes(allCodes);
+  RESULT={date:today(),tool:"手工版采集器v8",cf_domain:CF_DOMAIN||"未配置",stocks:{},indices:{},etfs:{},fund_flow:{},breadth:{},sectors:{}};
+
+  // 个股
+  for(const [n,c] of POOL){
+    if(q[c]){const d=pq(q[c]);RESULT.stocks[n]={code:c,price:d.price,pct:d.pct,amount_wan:d.amount_wan,pe:d.pe,pb:d.pb,source:"✅硬数据",src:"https://qt.gtimg.cn/q="+c};}
+    else RESULT.stocks[n]={code:c,missing:true,source:"❌未获取"};
+  }
+  // 指数
+  for(const [n,c] of IDX){if(q[c]){const d=pq(q[c]);RESULT.indices[n]={code:c,price:d.price,pct:d.pct,source:"✅硬数据",src:"https://qt.gtimg.cn/q="+c};}}
+  // ETF
+  for(const [n,c] of ETF){if(q[c]){const d=pq(q[c]);RESULT.etfs[n]={code:c,price:d.price,pct:d.pct,source:"✅硬数据",src:"https://qt.gtimg.cn/q="+c};}}
+
+  setSt("⏳ ② 采集资金流（东财"+(CF_DOMAIN?"走CF代理":"直连")+"）...","#fffbeb","#92400e");
+  for(const [n,c] of POOL){
+    RESULT.fund_flow[n]=await emFlow(c);
+    await sleep(800+Math.random()*400); // 防封
+  }
+
+  setSt("⏳ ③ 采集广度/板块...","#fffbeb","#92400e");
+  RESULT.breadth=await emBreadth();
+  await sleep(600);
+  RESULT.sectors=await emSectors();
+
+  renderTable();
+  $("cpBtn").style.display="block";
+  $("json").style.display="block";
+  $("json").textContent=JSON.stringify(RESULT,null,2);
+  setSt("✅ 完成 · 表格已生成 · 关联手工版跟踪表","#f0fdf4","#166534");
+}
+
+// ========== 表格渲染 ==========
+function renderTable(){
+  let h='';
+
+  h+=`<div class="sec"><h3>表1 · 个股行情（关联手工版跟踪表 §1）</h3><table>
+  <tr><th>名称</th><th>代码</th><th>价格</th><th>涨跌幅%</th><th>成交额(万)</th><th>PE</th><th>PB</th><th>来源</th></tr>`;
+  for(const [n,v] of Object.entries(RESULT.stocks)){
+    h+=`<tr><td>${n}</td><td>${v.code||''}</td><td>${v.price??'-'}</td><td>${v.pct??'-'}</td><td>${v.amount_wan??'-'}</td><td>${v.pe||'-'}</td><td>${v.pb||'-'}</td><td><span class="tag-hard">${v.source||''}</span><span class="src">${v.src||''}</span></td></tr>`;
+  }
+  h+=`</table><p class="note">↑ 填入手工版跟踪表「个股行情」区域</p></div>`;
+
+  h+=`<div class="sec"><h3>表2 · 指数/ETF（关联手工版跟踪表 §2）</h3><table>
+  <tr><th>名称</th><th>代码</th><th>价格</th><th>涨跌幅%</th><th>来源</th></tr>`;
+  [...Object.entries(RESULT.indices),...Object.entries(RESULT.etfs)].forEach(([n,v])=>{
+    h+=`<tr><td>${n}</td><td>${v.code}</td><td>${v.price}</td><td>${v.pct}%</td><td><span class="tag-hard">${v.source}</span><span class="src">${v.src}</span></td></tr>`;
+  });
+  h+=`</table><p class="note">↑ 填入手工版跟踪表「盘面环境」区域</p></div>`;
+
+  h+=`<div class="sec"><h3>表3 · 主力资金近5日（关联手工版跟踪表 §3）</h3><table>
+  <tr><th>名称</th><th>近5日逐日净流入(亿)</th><th>状态</th><th>通道</th><th>来源</th></tr>`;
+  for(const [n,v] of Object.entries(RESULT.fund_flow)){
+    if(v.ok){
+      h+=`<tr><td>${n}</td><td>${v.rows.map(r=>r.date+":"+r.net_yi).join('<br>')}</td><td><span class="tag-est">📊估算</span></td><td>${v.via||''}</td><td><span class="src">${v.src}</span></td></tr>`;
+    }else{
+      h+=`<tr><td>${n}</td><td><span class="empty">${v.error||'未获取'}</span></td><td><span class="tag-miss">❌失败</span></td><td>${v.via||''}</td><td><span class="src">${v.src}</span></td></tr>`;
+    }
+  }
+  h+=`</table><p class="note">↑ 填入手工版跟踪表「个股主力资金」区域</p></div>`;
+
+  h+=`<div class="sec"><h3>表4 · 市场广度（关联手工版跟踪表 §4）</h3><table>
+  <tr><th>项目</th><th>数值</th><th>状态</th><th>通道</th><th>来源</th></tr>`;
+  if(RESULT.breadth.ok){
+    const b=RESULT.breadth.data;
+    h+=`<tr><td>上涨</td><td>${b.up}</td><td><span class="tag-est">📊估算</span></td><td rowspan="5">${RESULT.breadth.via||''}</td><td rowspan="5"><span class="src">${RESULT.breadth.src}</span></td></tr>
+    <tr><td>下跌</td><td>${b.down}</td><td><span class="tag-est">📊估算</span></td></tr>
+    <tr><td>涨停</td><td>${b.limit_up}</td><td><span class="tag-est">📊估算</span></td></tr>
+    <tr><td>跌停</td><td>${b.limit_down}</td><td><span class="tag-est">📊估算</span></td></tr>
+    <tr><td>合计</td><td>${b.total}</td><td><span class="tag-est">📊估算</span></td></tr>`;
+  }else{
+    h+=`<tr><td colspan="2"><span class="empty">${RESULT.breadth.error||'未获取'}</span></td><td><span class="tag-miss">❌失败</span></td><td>${RESULT.breadth.via||''}</td><td><span class="src">${RESULT.breadth.src}</span></td></tr>`;
+  }
+  h+=`</table><p class="note">↑ 填入手工版跟踪表「涨跌家数」区域</p></div>`;
+
+  h+=`<div class="sec"><h3>表5 · 板块强弱（关联手工版跟踪表 §5）</h3><table>
+  <tr><th>方向</th><th>板块</th><th>涨跌幅%</th><th>状态</th><th>通道</th><th>来源</th></tr>`;
+  if(RESULT.sectors.ok){
+    RESULT.sectors.top.forEach(s=>{h+=`<tr><td>领涨</td><td>${s.name}</td><td>${s.pct}%</td><td><span class="tag-est">📊估算</span></td><td rowspan="2">${RESULT.sectors.via||''}</td><td rowspan="2"><span class="src">${RESULT.sectors.src}</span></td></tr>`;});
+    RESULT.sectors.bottom.forEach(s=>{h+=`<tr><td>领跌</td><td>${s.name}</td><td>${s.pct}%</td><td><span class="tag-est">📊估算</span></td></tr>`;});
+  }else{
+    h+=`<tr><td colspan="3"><span class="empty">${RESULT.sectors.error||'未获取'}</span></td><td><span class="tag-miss">❌失败</span></td><td>${RESULT.sectors.via||''}</td><td><span class="src">${RESULT.sectors.src}</span></td></tr>`;
+  }
+  h+=`</table><p class="note">↑ 填入手工版跟踪表「板块强弱」区域</p></div>`;
+
+  $("out").innerHTML=h;
+}
+
+// ========== 复制 ==========
+function copyTable(){
+  let txt="手工版跟踪表数据（"+RESULT.date+"）\n\n";
+  txt+="【个股行情】\n";
+  for(const [n,v] of Object.entries(RESULT.stocks)){txt+=`${n}\t${v.price}\t${v.pct}%\t${v.amount_wan}万\t${v.pe}\t${v.pb}\n`;}
+  txt+="\n【指数/ETF】\n";
+  [...Object.entries(RESULT.indices),...Object.entries(RESULT.etfs)].forEach(([n,v])=>{txt+=`${n}\t${v.price}\t${v.pct}%\n`;});
+  txt+="\n【主力资金(近5日·亿)】\n";
+  for(const [n,v] of Object.entries(RESULT.fund_flow)){txt+=`${n}\t${v.ok?v.rows.map(r=>r.net_yi).join(','):'未获取'}\n`;}
+  txt+="\n【市场广度】\n";
+  if(RESULT.breadth.ok){const b=RESULT.breadth.data;txt+=`涨${b.up} 跌${b.down} 涨停${b.limit_up} 跌停${b.limit_down}\n`;}
+  txt+="\n【板块】\n";
+  if(RESULT.sectors.ok){txt+=`领涨:${RESULT.sectors.top.map(s=>s.name+s.pct+'%').join(',')}\n领跌:${RESULT.sectors.bottom.map(s=>s.name+s.pct+'%').join(',')}\n`;}
+  navigator.clipboard&&navigator.clipboard.writeText(txt);
+  $("cpBtn").textContent="✅ 已复制";
+  setTimeout(()=>$("cpBtn").textContent="📋 复制表格文本",2000);
+}
+</script>
+</body>
+</html>
